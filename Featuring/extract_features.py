@@ -1,5 +1,5 @@
 """
-Nucleus feature extraction - no QuPath required.
+Nucleus feature extraction - Python version.
 
 Produces the same 50 measurements as the QuPath pipeline, so output is a
 drop-in replacement for *_gt_measurements.csv.
