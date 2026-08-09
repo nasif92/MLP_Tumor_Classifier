@@ -1,5 +1,5 @@
 """
-Nucleus feature extraction - Python version.
+Nucleus feature extraction - no QuPath required.
 
 Produces the same 50 measurements as the QuPath pipeline, so output is a
 drop-in replacement for *_gt_measurements.csv.
@@ -48,8 +48,8 @@ from scipy.spatial import cKDTree
 # Any of them can still be overridden with --wsi / --geojson / --annotations.
 # Set DEFAULT_ANNOTATIONS to None to skip label assignment.
 # ---------------------------------------------------------------------------
-DEFAULT_WSI = "/mnt/NAS/PDL1-2026/TNBC-D/D1.svs"
-DEFAULT_GEOJSON = "/mnt/NAS/PDL1-2026-Detections/TNBC-D/cellpose-dino/D1.geojson.gz"
+DEFAULT_WSI = "/mnt/NAS/PDL1-2026/TNBC/D1.svs"
+DEFAULT_GEOJSON = "/mnt/NAS/PDL1-2026-Detections/TNBC/cellpose-dino/D1.geojson.gz"
 DEFAULT_ANNOTATIONS = "/mnt/NAS/QuPath_Projects_AA/cellpose-dino-cls/annotation_exports/D1/D1_annotations.geojson"
 DEFAULT_OUT = "D1_gt_measurements.csv"
 
@@ -343,22 +343,109 @@ class NucleusFeatureExtractor:
         feats.update(intensity_features_from_patch(arr, mask=mask))
         return feats
 
-    def extract_many(self, polygons, centroids=None, progress_every=5000):
+    def extract_many(self, polygons, centroids=None, progress_every=5000,
+                     tile_size=2048):
         """Loop over polygons, returning (DataFrame of base features,
-        (N,2) array of centroids)."""
-        rows, cents = [], []
+        (N,2) array of centroids).
+
+        Nuclei are grouped by image tile so each region of the slide is read
+        and deconvolved ONCE, rather than once per nucleus. openslide has to
+        decode a whole JPEG tile to return even a 30x30 crop, so without
+        this the same tile gets decoded dozens of times. Pass tile_size=0
+        for the simple per-nucleus path.
+        """
+        n = len(polygons)
+        polys = [np.asarray(p, dtype=np.float64) for p in polygons]
+        cents = np.asarray(
+            [p.mean(axis=0) for p in polys] if centroids is None else centroids,
+            dtype=np.float64)
+        if n == 0:
+            return pd.DataFrame(columns=BASE_FEATURES), cents.reshape(0, 2)
+
+        if tile_size <= 0:
+            rows = [self.extract_one(p, centroid=c) for p, c in zip(polys, cents)]
+            return pd.DataFrame(rows, columns=BASE_FEATURES), cents
+
+        valid = np.array([p.ndim == 2 and p.shape[1] == 2 and len(p) >= 3
+                          for p in polys])
+        rows = [None] * n
+
+        bb = np.zeros((n, 4))
+        for i, p in enumerate(polys):
+            if valid[i]:
+                bb[i] = [p[:, 0].min(), p[:, 1].min(), p[:, 0].max(), p[:, 1].max()]
+        # Pad each tile read by the largest nucleus, so every nucleus assigned
+        # to a tile has its whole bounding box inside that read.
+        if valid.any():
+            pad = int(np.ceil(max((bb[valid, 2] - bb[valid, 0]).max(),
+                                  (bb[valid, 3] - bb[valid, 1]).max()))) + 2
+        else:
+            pad = 2
+
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for i in range(n):
+            if not valid[i]:
+                rows[i] = nan_base_features()
+                continue
+            groups[(int(bb[i, 0] // tile_size), int(bb[i, 1] // tile_size))].append(i)
+
         t0 = time.time()
-        for i, poly in enumerate(polygons):
-            pts = np.asarray(poly, dtype=np.float64)
-            c = (pts.mean(axis=0) if centroids is None
-                 else np.asarray(centroids[i], dtype=np.float64))
-            rows.append(self.extract_one(pts, centroid=c))
-            cents.append(c)
-            if progress_every and (i + 1) % progress_every == 0:
-                rate = (i + 1) / max(time.time() - t0, 1e-9)
-                left = (len(polygons) - i - 1) / rate
-                print(f"    {i+1}/{len(polygons)} ({rate:.0f}/s, {left:.0f}s left)")
-        return pd.DataFrame(rows, columns=BASE_FEATURES), np.asarray(cents)
+        done = 0
+        for (gx, gy), idxs in groups.items():
+            x0, y0 = gx * tile_size, gy * tile_size
+            got = self.read_bbox(x0 - 1, y0 - 1, tile_size + pad, tile_size + pad)
+            if got is None:
+                for i in idxs:
+                    f = shape_features(polys[i], self.mpp)
+                    f.update({k: np.nan for k in INTENSITY_FEATURES})
+                    rows[i] = f
+                done += len(idxs)
+                continue
+
+            arr, ax0, ay0 = got
+            # The tile is read once (the expensive part on a real WSI), but
+            # deconvolution runs per nucleus sub-window: nuclei cover ~1% of
+            # a tile, so deconvolving the whole thing wastes most of the work.
+            th, tw = arr.shape[:2]
+
+            for i in idxs:
+                pts = polys[i]
+                f = shape_features(pts, self.mpp)
+                sx0 = max(0, int(np.floor(bb[i, 0])) - 1 - ax0)
+                sy0 = max(0, int(np.floor(bb[i, 1])) - 1 - ay0)
+                sx1 = min(tw, int(np.ceil(bb[i, 2])) + 2 - ax0)
+                sy1 = min(th, int(np.ceil(bb[i, 3])) + 2 - ay0)
+                if sx1 <= sx0 or sy1 <= sy0:
+                    f.update({k: np.nan for k in INTENSITY_FEATURES})
+                    rows[i] = f
+                    continue
+
+                mask = rasterize_polygon(pts, ax0 + sx0, ay0 + sy0,
+                                         sx1 - sx0, sy1 - sy0)
+                if not mask.any():
+                    # Sub-pixel or degenerate nucleus - use the pixel nearest
+                    # its centroid rather than losing the row.
+                    ix = int(round(cents[i][0])) - ax0 - sx0
+                    iy = int(round(cents[i][1])) - ay0 - sy0
+                    if 0 <= iy < mask.shape[0] and 0 <= ix < mask.shape[1]:
+                        mask[iy, ix] = True
+                    else:
+                        f.update({k: np.nan for k in INTENSITY_FEATURES})
+                        rows[i] = f
+                        continue
+
+                f.update(intensity_features_from_patch(
+                    arr[sy0:sy1, sx0:sx1], mask=mask))
+                rows[i] = f
+
+            prev = done
+            done += len(idxs)
+            if progress_every and (done // progress_every) > (prev // progress_every):
+                rate = done / max(time.time() - t0, 1e-9)
+                print(f"    {done}/{n} ({rate:.0f}/s, {(n-done)/rate:.0f}s left)")
+
+        return pd.DataFrame(rows, columns=BASE_FEATURES), cents
 
     def close(self):
         if self._slide is not None:
