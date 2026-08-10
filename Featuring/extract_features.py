@@ -590,7 +590,8 @@ def polygons_from_geojson(path, min_points=3):
     return out
 
 
-def assign_labels(centroids_px, annotation_path, verbose=True):
+def assign_labels(centroids_px, annotation_path, verbose=True,
+                  allow_unclassified=False):
     """Point-in-polygon against ground-truth regions, vectorised.
 
     Where a nucleus falls in nested regions the smallest (most specific)
@@ -600,6 +601,12 @@ def assign_labels(centroids_px, annotation_path, verbose=True):
     is already its most specific region and it can be dropped from further
     testing. Combined with a batched bounding-box prefilter this turns
     O(nuclei x regions) Python-level work into a handful of numpy passes.
+
+    allow_unclassified : for INFERENCE, where an annotation marks *where*
+        to classify rather than *what* the region is. Unclassified regions
+        are then kept and their nuclei labelled "Region", so the caller can
+        use the result purely as a spatial filter. Off by default, since a
+        training set needs real class names.
     """
     from matplotlib.path import Path as MplPath
 
@@ -607,12 +614,16 @@ def assign_labels(centroids_px, annotation_path, verbose=True):
     n = len(centroids_px)
 
     regions = []
+    n_unclassified = 0
     for f in load_geojson(annotation_path):
         props = f.get("properties", {}) or {}
         cls = props.get("classification")
         nm = cls.get("name") if isinstance(cls, dict) else props.get("name")
         if not nm:
-            continue
+            if not allow_unclassified:
+                n_unclassified += 1
+                continue
+            nm = "Region"
         for ring in feature_polygons(f):
             if len(ring) < 3:
                 continue
@@ -622,6 +633,9 @@ def assign_labels(centroids_px, annotation_path, verbose=True):
     if not regions:
         if verbose:
             print("    no classified annotation regions found")
+            if n_unclassified:
+                print(f"    ({n_unclassified} unclassified region(s) skipped - "
+                      f"pass allow_unclassified=True to use them as a filter)")
         return [None] * n
 
     regions.sort(key=lambda r: r[2])  # smallest area first
