@@ -100,10 +100,19 @@ def main():
 
     keep_idx = np.arange(len(polys))
     if args.annotations:
-        labels = ef.assign_labels(centroids_all, args.annotations, verbose=False)
+        # At inference an annotation marks WHERE to classify, so it is
+        # usually unclassified - unlike training, where the class is the label.
+        labels = ef.assign_labels(centroids_all, args.annotations, verbose=True,
+                                  allow_unclassified=True)
         keep_idx = np.array([i for i, l in enumerate(labels) if l is not None])
         if keep_idx.size == 0:
-            raise SystemExit("No nuclei inside the given annotations.")
+            print("\nNo nuclei fell inside the annotations.")
+            print("  Detection centroids span "
+                  f"x[{centroids_all[:,0].min():.0f}-{centroids_all[:,0].max():.0f}] "
+                  f"y[{centroids_all[:,1].min():.0f}-{centroids_all[:,1].max():.0f}]")
+            print("  If the annotation lies outside that range, the two files are"
+                  " in different coordinate spaces.")
+            raise SystemExit(1)
         print(f"  {keep_idx.size} inside annotations "
               f"(skipping {len(polys) - keep_idx.size})")
         polys = [polys[i] for i in keep_idx]
