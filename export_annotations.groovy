@@ -13,7 +13,19 @@ def keepClasses = [
     "Tumor", "Stroma", "Immune cells",
     "Normal-GI-Mucosa", "Normal-foveola", "Normal-Squamous", "Normal-Brunner",
     "Normal-endometrial-Ep", "Normal-Glands", "Normal-Smooth-Muscle",
-    "Necrosis", "Other"
+    "Necrosis", "Other",
+    "Ghost",  // exported so it correctly "wins" if nested inside a larger
+              // Tumor/Stroma annotation (smallest-region-wins in
+              // assign_labels) - dropped later by Python's collapse_label,
+              // not excluded here. Excluding it HERE would let a nucleus
+              // meant to be carved out instead inherit the surrounding
+              // region's real class.
+    // TEXTURE annotations (real ground truth - collapsed to Tumor/Stroma/
+    // Immune in Python) and MIXED-* (NOT ground truth - dropped in Python,
+    // same reasoning as Ghost above: must be exported here so nesting
+    // resolves correctly, exclusion happens downstream).
+    "TextTumHigh", "TextTumLow", "TextStromHigh", "TextStromLow", "TextImmune",
+    "MIXED-MostStom", "MIXED-MostTum"
 ] as Set
 
 boolean EXPORT_ALL_CLASSES = false   // true = ignore keepClasses, export everything
