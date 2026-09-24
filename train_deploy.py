@@ -13,7 +13,6 @@ Usage:
     python3 train_deploy.py --feat_dir <dir_with_one_slide> --ann_dir <ann_dir> --out one_slide.pt
 """
 import argparse
-import glob
 import gzip
 import hashlib
 import json
@@ -21,7 +20,7 @@ import os
 import re
 import sys
 from collections import Counter
-from config import phase1, phase2, collapse_label, DEFAULT_SUBTYPES, all_features, ref_set_no_cells, ref_set
+import config as cf
 import numpy as np
 import pandas as pd
 import torch
@@ -29,11 +28,11 @@ import torch.nn as nn
 
 # Curated, pre-classified reference/validation slides - used as the default
 # --test_feat_dir so a plain run evaluates against this set automatically.
-REFERENCE_TEST_DIR = ref_set_no_cells
+REFERENCE_TEST_DIR = cf.ref_set_ki67_all_detections
+REFERENCE_ANN_DIR = cf.ref_set_ann_ki67
 # Single unified annotation directory covering ALL reference slides/subtypes
 # (previously fragmented per-subtype, e.g. "annotations-rds", "annotations-cis" -
 # now consolidated so --ann_dir/--test_ann_dir need only ever point here).
-REFEREBCE_ANN = "/mnt/NAS/QuPath_Projects_AA/cellpose-dino-cls/qp-6_reference_slides-no_artifacts-no_cells/annotations"
 
 NON_FEATURE_COLS = {
     "wsi_name", "nucleus_id", "cx_wsi", "cy_wsi", "label", "is_ground_truth",
@@ -352,7 +351,7 @@ def per_class_accuracy(y_true, y_pred, classes):
 def load_and_label(df_ext, classes, feat_cols=None, medians=None, mu=None, sd=None):
     """Apply collapse_label + class filtering, and optionally the training
     run's fixed feature columns/medians/mu/sd (for a val/test set)."""
-    df_ext["_label"] = df_ext["label"].apply(collapse_label)
+    df_ext["_label"] = df_ext["label"].apply(cf.collapse_label)
     n_dropped = int(df_ext["_label"].isna().sum())
     if n_dropped:
         print(f"  dropped {n_dropped} rows with unmapped/excluded raw labels:")
@@ -385,7 +384,7 @@ def report_eval(name, y_true, y_pred, classes):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--feat_dir", default=all_features,
+    ap.add_argument("--feat_dir", default=cf.all_features,
                     help="Root directory to walk for <slide>-feat-no_cells.geojson(.gz) exports.")
     ap.add_argument("--feat_pattern", default="-feat-no_cells.geojson.gz",
                     help="Filename suffix identifying a slide's feature file under "
@@ -394,7 +393,7 @@ def main():
                          "uses plain '<slide>.geojson.gz' naming with no '-feat-no_cells' "
                          "infix, since it's already pre-classified in-file rather than "
                          "exported from the feature-extraction pipeline.")
-    ap.add_argument("--ann_dir", nargs="+", default=[phase1, phase2],
+    ap.add_argument("--ann_dir", nargs="+", default=[cf.phase1, cf.phase2],
                     help="One or more directories containing <slide>.geojson(.gz) "
                          "annotation files - searched in order, first match per "
                          "slide wins. Defaults to phase1_annotations + "
@@ -408,7 +407,7 @@ def main():
                          "re-enable combining a second data source.")
     ap.add_argument("--phase2_ann_dir", default=None,
                     help="Annotation directory matching --phase2_feat_dir.")
-    ap.add_argument("--subtypes", nargs="+", default=DEFAULT_SUBTYPES)
+    ap.add_argument("--subtypes", nargs="+", default=cf.DEFAULT_SUBTYPES)
     ap.add_argument("--classes", nargs="+", default=["Tumor", "Non Tumor"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--holdout_frac", type=float, default=0.0,
@@ -420,9 +419,9 @@ def main():
                          "--holdout_frac of the training slides. 'test' (default) uses "
                          "--test_feat_dir/--test_ann_dir instead, training on ALL slides.")
     ap.add_argument("--hidden", nargs="+", type=int, default=[96, 48, 24, 12, 6])
-    ap.add_argument("--dropout", type=float, default=0.3)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--weight_decay", type=float, default=0)
+    ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-3)
     ap.add_argument("--batch_size", type=int, default=10000)
     ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--reweight_power", type=float, default=0.5)
@@ -435,7 +434,7 @@ def main():
                          "given - kept at a ready-to-use default (1.5x) for whenever "
                          "phase-2 data is reintroduced.")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--device", default=None,
+    ap.add_argument("--device", default='cuda',
                     help="Force a specific device, e.g. 'cuda', 'cpu'. Auto-detects otherwise.")
     ap.add_argument("--tb_dir", default=None,
                     help="TensorBoard log directory. Defaults to '<out>_tb/'.")
@@ -450,7 +449,7 @@ def main():
                          "validation set (--holdout_frac > 0 or --val_source test).")
     ap.add_argument("--patience", type=int, default=30,
                     help="Epochs without val-loss improvement before stopping.")
-    ap.add_argument("--lr_schedule", choices=["none", "plateau", "cosine"], default="none",
+    ap.add_argument("--lr_schedule", choices=["none", "plateau", "cosine"], default="plateau",
                     help="plateau halves --lr on val-loss stall (needs a validation set); "
                          "cosine decays --lr smoothly over --epochs regardless of holdout.")
     ap.add_argument("--test_feat_dir", default=REFERENCE_TEST_DIR,
@@ -508,7 +507,7 @@ def main():
     if not args.phase2_feat_dir and not named_phase2:
         print("  (phase1/phase2 split not in use this run - all data treated as phase 1)")
 
-    df["_label"] = df["label"].apply(collapse_label)
+    df["_label"] = df["label"].apply(cf.collapse_label)
     dropped = df[df["_label"].isna()]
     if len(dropped):
         print(f"\nDropped {len(dropped)} rows with unmapped/excluded raw labels:")
@@ -561,7 +560,7 @@ def main():
 
     mu, sd = X_tr.mean(0), X_tr.std(0)
     sd[sd == 0] = 1.0
-    X_tr_s = ((X_tr - mu) / sd).astype(np.float32)
+    X_tr_s = np.clip((X_tr - mu) / sd, -20, 20).astype(np.float32)
 
     # Keep the whole training set resident on `device` and sample weighted
     # batches there directly (small tabular MLP - the full set fits easily).
@@ -663,6 +662,7 @@ def main():
             outputs = model(xb)
             loss = crit(outputs, yb)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             opt.step()
 
         # Full-pass train metrics (representative of deployment performance,
