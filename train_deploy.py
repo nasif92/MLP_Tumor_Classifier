@@ -419,7 +419,7 @@ def main():
                          "--holdout_frac of the training slides. 'test' (default) uses "
                          "--test_feat_dir/--test_ann_dir instead, training on ALL slides.")
     ap.add_argument("--hidden", nargs="+", type=int, default=[96, 48, 24, 12, 6])
-    ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--dropout", type=float, default=0.3)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--weight_decay", type=float, default=1e-3)
     ap.add_argument("--batch_size", type=int, default=10000)
@@ -434,7 +434,7 @@ def main():
                          "given - kept at a ready-to-use default (1.5x) for whenever "
                          "phase-2 data is reintroduced.")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--device", default='cuda',
+    ap.add_argument("--device", default='',
                     help="Force a specific device, e.g. 'cuda', 'cpu'. Auto-detects otherwise.")
     ap.add_argument("--tb_dir", default=None,
                     help="TensorBoard log directory. Defaults to '<out>_tb/'.")
