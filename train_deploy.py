@@ -456,6 +456,66 @@ def report_eval_by_subtype(name, y_true, y_pred, classes, subtypes_arr, slides_a
         f"{st}={g['acc'].mean():.4f}" for st, g in per.groupby("subtype")))
 
 
+def report_ghost_aware(name, y_true, logits, classes, subtypes_arr, slides_arr):
+    """Extra scoring when 'Ghost' is one of the trained classes (otherwise a no-op).
+
+    A nucleus PREDICTED Ghost is rejected: at deployment it is left unclassified. All
+    accuracies below are over nuclei whose TRUE label is a real class (Tumor / Non Tumor):
+      forced    pick Tumor vs Non Tumor ignoring the Ghost output - directly comparable
+                to a model trained without Ghost (shows what adding the class costs)
+      strict    a Ghost prediction counts as an error (what rejecting costs you)
+      coverage  fraction of real nuclei NOT rejected
+      kept      accuracy among the real nuclei that were not rejected
+    Ghost precision / recall are over ALL nuclei, true ghosts included.
+    Slide-mean = mean over slides, like the 'slide-mean acc by subtype' line."""
+    if "Ghost" not in classes:
+        return
+    g = classes.index("Ghost")
+    real = [i for i in range(len(classes)) if i != g]
+    logits = np.asarray(logits)
+    pred = logits.argmax(1)
+    forced = np.asarray(real)[logits[:, real].argmax(1)]
+    subtypes_arr, slides_arr = np.asarray(subtypes_arr), np.asarray(slides_arr)
+
+    def prec_rec(yt, pr):
+        tp = int(((pr == g) & (yt == g)).sum())
+        npred, ntrue = int((pr == g).sum()), int((yt == g).sum())
+        return (tp / npred if npred else np.nan), (tp / ntrue if ntrue else np.nan), ntrue
+
+    rows = []
+    for slide in pd.unique(slides_arr):
+        m = slides_arr == slide
+        yt, pr, fo = y_true[m], pred[m], forced[m]
+        r = yt != g
+        nr = int(r.sum())
+        kept = r & (pr != g)
+        p, rc, _ = prec_rec(yt, pr)
+        rows.append({
+            "slide": slide, "subtype": subtypes_arr[m][0], "n_real": nr, "n_ghost": int((~r).sum()),
+            "forced": float((fo[r] == yt[r]).mean()) if nr else np.nan,
+            "strict": float((pr[r] == yt[r]).mean()) if nr else np.nan,
+            "coverage": float(kept.sum() / nr) if nr else np.nan,
+            "kept": float((pr[kept] == yt[kept]).mean()) if kept.any() else np.nan,
+            "ghost_P": p, "ghost_R": rc})
+    per = pd.DataFrame(rows).set_index("slide")
+    print(f"\n{name} - ghost-aware (Ghost prediction = rejected), per slide:")
+    print(per.sort_values(["subtype", "forced"]).round(3).to_string())
+
+    def by_st(col):
+        return ", ".join(f"{st}={v:.4f}" for st, v in per.groupby("subtype")[col].mean().items())
+    print("forced slide-mean acc by subtype: " + by_st("forced"))
+    print("strict slide-mean acc by subtype: " + by_st("strict"))
+    print("coverage slide-mean by subtype: " + by_st("coverage"))
+    print("kept slide-mean acc by subtype: " + by_st("kept"))
+    gp, gr = [], []
+    for st in sorted(set(subtypes_arr)):
+        m = subtypes_arr == st
+        p, rc, nt = prec_rec(y_true[m], pred[m])
+        gp.append(f"{st}={p:.4f}"); gr.append(f"{st}={rc:.4f}")
+    print("ghost precision by subtype: " + ", ".join(gp))
+    print("ghost recall by subtype: " + ", ".join(gr))
+
+
 def slide_overlap_check(train_slides, test_slides, what="validation"):
     overlap = sorted(set(train_slides) & set(test_slides))
     if overlap:
@@ -520,8 +580,10 @@ def main():
                          "happens to correlate with site.")
     ap.add_argument("--domain_hidden", type=int, default=32,
                     help="Hidden width of the (small, 2-layer) domain head.")
-    ap.add_argument("--feature_set", default="all", choices=sorted(cf.FEATURE_SETS),
-                help=f"Named feature set from config.FEATURE_SETS. Available: {sorted(cf.FEATURE_SETS)}.")
+    ap.add_argument("--feature_set", default="default", choices=sorted(cf.FEATURE_SETS),
+                    help=f"Named feature set from config.FEATURE_SETS to train on "
+                         f"(default: 'default', which excludes Smoothed: measurements). "
+                         f"Available: {sorted(cf.FEATURE_SETS)}.")
     ap.add_argument("--feature_list", default=None,
                     help="Path to a one-off feature list file (plain text, one name per "
                          "line, or JSON) instead of a config.FEATURE_SETS entry.")
@@ -573,8 +635,16 @@ def main():
     ap.add_argument("--moe_balance_weight", type=float, default=0.01,
                     help="Weight of the gate load-balancing term KL(usage||uniform) (0 = off).")
     ap.add_argument("--moe_bag", action="store_true",
-                    help="Online bagging on the aux losses: each expert sees its own "
-                         "Poisson(1) bootstrap weights, for extra diversity (Windeatt 2008).")
+                    help="Online bagging: each (nucleus, expert) pair gets a Poisson(1) "
+                         "weight on EVERY gradient reaching that expert, so each expert "
+                         "trains on its own bootstrap-like sample (Windeatt 2008, S.2).")
+    ap.add_argument("--moe_gate", choices=list(moe.GATE_TYPES), default="learned",
+                    help="How expert outputs are combined. learned = per-nucleus gate on "
+                         "features[+stain] (default, the original MoE); uniform = equal "
+                         "weights; global = one learned weight per expert; per_stain = one "
+                         "learned weight per expert per stain; vote = no head, equal-weight "
+                         "average of the experts' own class probabilities (Windeatt Fig. 1); "
+                         "prob_mix = no head, learned per-nucleus gate over those probabilities.")
     ap.add_argument("--moe_gate_temp", type=float, default=1.0,
                     help="Gate softmax temperature (>1 = softer mixing, <1 = sharper routing).")
     ap.add_argument("--moe_no_subtype_gate", action="store_true",
@@ -815,6 +885,7 @@ def main():
             "subtype_dim": 8, "use_subtype": not args.moe_no_subtype_gate,
             "gate_temp": args.moe_gate_temp, "expert_dropout": args.moe_expert_dropout,
             "subtype_drop": args.moe_subtype_drop,
+            "gate_type": args.moe_gate, "bag": args.moe_bag,
         }
 
     def make_model():
@@ -824,8 +895,15 @@ def main():
 
     model = make_model()
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"\nModel: {args.arch.upper()}  ({n_params:,} parameters)"
-          + (f"  stain-conditioned gate over {subtype_vocab}" if moe_config and moe_config["use_subtype"] else ""))
+    msg = f"\nModel: {args.arch.upper()}  ({n_params:,} parameters)"
+    if args.arch == "moe":
+        msg += (f"  gate={model.gate_type}"
+                + (f", stain-conditioned over {subtype_vocab}" if model.use_subtype else "")
+                + f" | aux_weight={args.moe_aux_weight} balance={args.moe_balance_weight} "
+                  f"expert_dropout={args.moe_expert_dropout} stain_dropout="
+                  f"{args.moe_subtype_drop if model.use_subtype else 'n/a'} bag={args.moe_bag} "
+                  f"domain_adv={args.domain_adversarial}")
+    print(msg)
     crit = nn.CrossEntropyLoss()
 
     # ---------------------------------------------------- domain-adversarial
@@ -991,7 +1069,7 @@ def main():
                 outputs, aux = model(xb, stb, return_aux=True)
                 feats = aux["fused"]
                 extra, parts = moe.auxiliary_loss(aux, yb, args.moe_aux_weight,
-                                                  args.moe_balance_weight, args.moe_bag)
+                                                  args.moe_balance_weight, model)
                 loss = crit(outputs, yb) + extra
                 moe_parts_acc.append(parts)
             elif domain_head is not None:
@@ -1135,12 +1213,15 @@ def main():
     if has_val:
         model.eval()
         with torch.no_grad():
-            pred = model(X_te_t, st_te_t).argmax(1).cpu().numpy()
+            logits_val = model(X_te_t, st_te_t).cpu().numpy()
+        pred = logits_val.argmax(1)
         tag = "best epoch" if args.early_stop else "final epoch"
         if args.early_stop:
             # `model` already IS the reloaded best checkpoint - full report.
             report_eval_by_subtype(f"VALIDATION ({val_label.upper()}, {tag})",
                                    y_te, pred, classes, sub_te, slide_te)
+            report_ghost_aware(f"VALIDATION ({val_label.upper()}, {tag})",
+                               y_te, logits_val, classes, sub_te, slide_te)
         else:
             # Brief one-liner here; the full report below is for the
             # checkpoint that's actually deployed (.best), which is what
@@ -1161,10 +1242,14 @@ def main():
             best_model.load_state_dict(best_ckpt["model_state"])
             best_model.eval()
             with torch.no_grad():
-                best_pred = best_model(X_te_t, st_te_t).argmax(1).cpu().numpy()
+                best_logits = best_model(X_te_t, st_te_t).cpu().numpy()
+            best_pred = best_logits.argmax(1)
             report_eval_by_subtype(
                 f"VALIDATION ({val_label.upper()}, best checkpoint epoch {best_ckpt['epoch']})",
                 y_te, best_pred, classes, sub_te, slide_te)
+            report_ghost_aware(
+                f"VALIDATION ({val_label.upper()}, best checkpoint epoch {best_ckpt['epoch']})",
+                y_te, best_logits, classes, sub_te, slide_te)
             if args.arch == "moe":
                 moe.report_experts(best_model, X_te_t, st_te_t, y_te, sub_te, classes,
                                    f"{val_label}, best checkpoint")
@@ -1195,12 +1280,20 @@ def main():
                 with torch.no_grad():
                     st_ext_t = torch.as_tensor(moe.subtype_indices(
                         df_ext["subtype"].to_numpy(), subtype_vocab), device=device)
-                    ext_pred = model(torch.from_numpy(X_ext_s).to(device),
-                                     st_ext_t).argmax(1).cpu().numpy()
+                    ext_logits = model(torch.from_numpy(X_ext_s).to(device),
+                                       st_ext_t).cpu().numpy()
+                ext_pred = ext_logits.argmax(1)
                 print(f"  {len(df_ext)} nuclei | {df_ext['slide_uid'].nunique()} slides")
                 report_eval_by_subtype("EXTERNAL TEST", y_ext, ext_pred, classes,
                                        df_ext["subtype"].to_numpy(),
                                        df_ext["slide_uid"].to_numpy())
+                report_ghost_aware("EXTERNAL TEST", y_ext, ext_logits, classes,
+                                   df_ext["subtype"].to_numpy(),
+                                   df_ext["slide_uid"].to_numpy())
+                if args.arch == "moe":
+                    moe.report_experts(model, torch.from_numpy(X_ext_s).to(device), st_ext_t,
+                                       y_ext, df_ext["subtype"].to_numpy(), classes,
+                                       "EXTERNAL TEST")
 
     torch.save(ckpt_dict(last_epoch, train_metrics, val_metrics), args.out)
     if args.early_stop and has_val:
