@@ -15,19 +15,25 @@ gate-weighted sum of expert embeddings goes through a shared classifier head.
         ├─ texture     ─► E_tex    ─► z4 ─┘
         └─ all cols + stain emb ─► gate ─► g (softmax over experts)
 
+The combiner is selectable (--moe_gate, see GATE_TYPES below): learned
+per-nucleus gate (above), uniform / global / per-stain weights on the
+embeddings, or - with no head - a uniform vote or learned mixture over the
+experts' own class probabilities (Windeatt 2008, Fig. 1 style).
+
 Training extras (all optional, all off at inference):
   * expert dropout     - whole experts masked per nucleus, gate renormalized,
                          so the head can't lean on one expert.
-  * auxiliary heads    - each expert has its own linear classifier trained
-                         with a small weight, so every expert stays
-                         independently discriminative (this is what keeps
-                         the members of an ensemble "accurate" in Windeatt's
-                         accuracy/diversity sense).
-  * online bagging     - per-expert Poisson(1) sample weights on the aux
-                         losses: an online approximation of training each
-                         base MLP on its own bootstrap replicate (Breiman's
-                         bagging, as used for MLP ensembles in Windeatt 2008),
-                         to inject diversity between experts.
+  * auxiliary loss     - each expert's own linear classifier must predict
+                         the class, and that gradient reaches the expert, so
+                         every expert stays independently discriminative
+                         ("accurate" in Windeatt's accuracy/diversity sense).
+                         The aux heads are ALSO always fit on detached expert
+                         outputs, so the diagnostics stay valid with it off.
+  * online bagging     - each (nucleus, expert) pair gets a Poisson(1) count
+                         that scales every gradient reaching that expert: an
+                         online version of training each base MLP on its own
+                         bootstrap replicate (Windeatt 2008, S.2), for
+                         diversity between experts.
   * load balancing     - KL(mean gate usage || uniform) across the batch,
                          which discourages collapse onto one expert while
                          still allowing per-nucleus specialization.
@@ -121,49 +127,101 @@ class Expert(nn.Module):
         return self.net(x)
 
 
+GATE_TYPES = ("learned", "uniform", "global", "per_stain", "vote", "prob_mix")
+# How the expert outputs are combined into one prediction:
+#   learned   - per-nucleus softmax gate (MLP on features [+ stain]) over expert
+#               DESCRIPTIONS, then a shared head.  (the original MoE)
+#   uniform   - equal weights on the descriptions, then the head. No learned weighting.
+#   global    - one learned weight per expert, same for every nucleus, then the head.
+#   per_stain - one learned weight per expert PER STAIN (table), then the head.
+#   vote      - no head: average of the experts' own class probabilities with
+#               equal weights (Windeatt 2008, Fig. 1: fixed combiner over decisions).
+#   prob_mix  - no head: learned per-nucleus gate over the experts' class probabilities.
+PROB_GATES = ("vote", "prob_mix")
+
+
 class MoEClassifier(nn.Module):
     def __init__(self, n_features, n_classes, groups, n_subtypes, d=32,
                  expert_hidden=32, gate_hidden=64, head_hidden=32, dropout=0.2,
                  subtype_dim=8, use_subtype=True, gate_temp=1.0,
-                 expert_dropout=0.15, subtype_drop=0.2):
+                 expert_dropout=0.15, subtype_drop=0.2, gate_type="learned", bag=False):
         super().__init__()
+        if gate_type not in GATE_TYPES:
+            raise ValueError(f"gate_type must be one of {GATE_TYPES}, got {gate_type!r}")
+        if gate_type == "per_stain" and not use_subtype:
+            raise ValueError("gate_type 'per_stain' needs the stain - drop --moe_no_subtype_gate "
+                             "(without the stain it is identical to 'global').")
+        self.gate_type = gate_type
+        self.bag = bag
         self.group_names = list(groups.keys())
         self.n_experts = len(self.group_names)
         for k, idx in groups.items():
             self.register_buffer(f"idx_{k}", torch.as_tensor(idx, dtype=torch.long), persistent=True)
         self.experts = nn.ModuleList(
             Expert(len(groups[k]), d, expert_hidden, dropout) for k in self.group_names)
+        # Per-expert classifiers. In 'vote'/'prob_mix' they ARE the model's
+        # classifiers; otherwise they are trained on detached expert outputs
+        # (diagnostics only) plus, if --moe_aux_weight > 0, an auxiliary loss.
         self.aux_heads = nn.ModuleList(nn.Linear(d, n_classes) for _ in self.group_names)
 
-        self.use_subtype = use_subtype
+        # The stain is only an input for gates that can use it.
+        self.use_subtype = use_subtype and gate_type in ("learned", "per_stain", "prob_mix")
         self.n_subtypes = n_subtypes                  # index n_subtypes == "unknown"
-        self.subtype_emb = nn.Embedding(n_subtypes + 1, subtype_dim) if use_subtype else None
-        g_in = n_features + (subtype_dim if use_subtype else 0)
-        self.gate = nn.Sequential(nn.Linear(g_in, gate_hidden), nn.GELU(),
-                                  nn.Dropout(dropout), nn.Linear(gate_hidden, self.n_experts))
-        self.head = nn.Sequential(nn.Linear(d, head_hidden), nn.GELU(),
-                                  nn.Dropout(dropout), nn.Linear(head_hidden, n_classes))
+        self.subtype_emb = (nn.Embedding(n_subtypes + 1, subtype_dim)
+                            if self.use_subtype and gate_type != "per_stain" else None)
+        self.gate = self.gate_param = None
+        if gate_type in ("learned", "prob_mix"):
+            g_in = n_features + (subtype_dim if self.subtype_emb is not None else 0)
+            self.gate = nn.Sequential(nn.Linear(g_in, gate_hidden), nn.GELU(),
+                                      nn.Dropout(dropout), nn.Linear(gate_hidden, self.n_experts))
+        elif gate_type == "global":
+            self.gate_param = nn.Parameter(torch.zeros(self.n_experts))
+        elif gate_type == "per_stain":
+            self.gate_param = nn.Parameter(torch.zeros(n_subtypes + 1, self.n_experts))
+        self.head = (nn.Sequential(nn.Linear(d, head_hidden), nn.GELU(),
+                                   nn.Dropout(dropout), nn.Linear(head_hidden, n_classes))
+                     if gate_type not in PROB_GATES else None)
         self.feat_dim = d
         self.gate_temp = gate_temp
         self.expert_dropout = expert_dropout
         self.subtype_drop = subtype_drop
 
     # ---------------------------------------------------------------- pieces
-    def _subtype_vec(self, x, subtype):
-        if not self.use_subtype:
-            return None
+    def _subtype_idx(self, x, subtype):
+        """Stain index per nucleus; 'unknown' when absent, and randomly during
+        training (stain dropout) so the model also works without a stain."""
         if subtype is None:
-            subtype = torch.full((x.shape[0],), self.n_subtypes, dtype=torch.long, device=x.device)
-        elif self.training and self.subtype_drop > 0:
+            return torch.full((x.shape[0],), self.n_subtypes, dtype=torch.long, device=x.device)
+        if self.training and self.subtype_drop > 0:
             drop = torch.rand(subtype.shape[0], device=x.device) < self.subtype_drop
             subtype = torch.where(drop, torch.full_like(subtype, self.n_subtypes), subtype)
-        return self.subtype_emb(subtype)
+        return subtype
+
+    def _gate_logits(self, x, subtype):
+        B = x.shape[0]
+        if self.gate_type in ("uniform", "vote"):
+            return x.new_zeros(B, self.n_experts)
+        if self.gate_type == "global":
+            return self.gate_param.expand(B, -1) / self.gate_temp
+        st = self._subtype_idx(x, subtype) if self.use_subtype else None
+        if self.gate_type == "per_stain":
+            return self.gate_param[st] / self.gate_temp
+        g_in = x if self.subtype_emb is None else torch.cat([x, self.subtype_emb(st)], 1)
+        return self.gate(g_in) / self.gate_temp
 
     def _run(self, x, subtype=None):
         zs = torch.stack([e(x.index_select(1, getattr(self, f"idx_{k}")))
                           for k, e in zip(self.group_names, self.experts)], dim=1)  # B,E,d
-        s = self._subtype_vec(x, subtype)
-        g_logits = self.gate(x if s is None else torch.cat([x, s], 1)) / self.gate_temp
+        if self.training and self.bag:
+            # Online bagging (Windeatt 2008 S.2 bootstraps each base MLP): every
+            # (nucleus, expert) pair gets a Poisson(1) count w. Forward values are
+            # unchanged, but the gradient reaching expert e from this nucleus is
+            # scaled by w - so ~37% of nuclei (w=0) are left out of each expert's
+            # training on every step, for EVERY loss (main, aux, domain). The
+            # gate/head see unweighted gradients - they are shared, not bagged.
+            w = torch.poisson(torch.ones(zs.shape[0], zs.shape[1], 1, device=zs.device))
+            zs = w * zs + (1 - w) * zs.detach()
+        g_logits = self._gate_logits(x, subtype)
         if self.training and self.expert_dropout > 0 and self.n_experts > 1:
             keep = torch.rand_like(g_logits) >= self.expert_dropout
             # always keep at least one expert (the gate's favourite) per nucleus
@@ -175,47 +233,76 @@ class MoEClassifier(nn.Module):
 
     # ----------------------------------------------------------- public API
     def forward(self, x, subtype=None, return_aux=False):
+        """Returns class logits. For 'vote'/'prob_mix' these are log-probabilities
+        of the mixture, log(sum_e g_e * p_e) - CrossEntropyLoss on them is exactly
+        the mixture's negative log-likelihood, and argmax is the prediction."""
         zs, g, fused = self._run(x, subtype)
-        logits = self.head(fused)
+        expert_logits = None
+        if self.head is not None:
+            logits = self.head(fused)
+        else:
+            expert_logits = torch.stack([h(zs[:, i]) for i, h in enumerate(self.aux_heads)], 1)
+            log_p = torch.log_softmax(expert_logits, dim=2)                    # B,E,C
+            log_g = torch.log(g.clamp_min(1e-12)).unsqueeze(-1)                # B,E,1
+            logits = torch.logsumexp(log_g + log_p, dim=1)                     # B,C
         if not return_aux:
             return logits
-        expert_logits = torch.stack([h(zs[:, i]) for i, h in enumerate(self.aux_heads)], 1)
-        return logits, {"gate": g, "fused": fused, "expert_logits": expert_logits}
+        if expert_logits is None:
+            expert_logits = torch.stack([h(zs[:, i]) for i, h in enumerate(self.aux_heads)], 1)
+        # Diagnostic copy on DETACHED expert outputs: trains the aux heads to read
+        # each expert without changing what the experts learn.
+        diag = (torch.stack([h(zs[:, i].detach()) for i, h in enumerate(self.aux_heads)], 1)
+                if self.head is not None else expert_logits)
+        return logits, {"gate": g, "fused": fused, "expert_logits": expert_logits,
+                        "expert_logits_diag": diag}
 
     def features(self, x, subtype=None):
-        """Fused embedding - what --domain_adversarial attaches to."""
+        """Gate-weighted expert embedding - what --domain_adversarial attaches to."""
         return self._run(x, subtype)[2]
 
     def classify(self, feats):
+        if self.head is None:
+            raise RuntimeError(f"gate_type {self.gate_type!r} has no head on the fused embedding")
         return self.head(feats)
 
 
-def auxiliary_loss(aux, y, aux_weight=0.2, balance_weight=0.01, bag=False):
-    """Extra MoE terms added to the main CE. Returns (loss, parts dict)."""
+def auxiliary_loss(aux, y, aux_weight=0.2, balance_weight=0.01, model=None):
+    """Extra MoE terms added to the main CE. Returns (loss, parts dict).
+
+    aux_weight > 0: each expert's own classifier must predict the class, and
+      that gradient DOES reach the experts (keeps every expert discriminative).
+    Always (embedding-mixing gates): the aux heads are also fit on DETACHED
+      expert outputs, so the per-expert diagnostics are valid even with
+      aux_weight = 0 - this term cannot change the experts, gate or head.
+    balance_weight > 0: KL(mean gate usage || uniform) over the batch.
+    (Poisson bagging is applied inside the model's forward, not here.)"""
     el = aux["expert_logits"]                     # B,E,C
     B, E, C = el.shape
-    ce = F.cross_entropy(el.reshape(B * E, C), y.repeat_interleave(E), reduction="none").view(B, E)
-    if bag:   # online bagging: each expert gets its own Poisson(1) bootstrap weights
-        w = torch.poisson(torch.ones_like(ce))
-        aux_ce = (ce * w).sum(0) / w.sum(0).clamp_min(1.0)
-    else:
-        aux_ce = ce.mean(0)
-    aux_term = aux_ce.mean()
+    yy = y.repeat_interleave(E)
+    aux_term = F.cross_entropy(el.reshape(B * E, C), yy)
+    loss = aux_weight * aux_term if aux_weight > 0 else el.new_zeros(())
+    if model is None or model.head is not None:
+        dl = aux["expert_logits_diag"]
+        loss = loss + F.cross_entropy(dl.reshape(B * E, C), yy)
     usage = aux["gate"].mean(0).clamp_min(1e-8)   # E
     balance = (usage * (usage * E).log()).sum()   # KL(usage || uniform), >= 0
-    loss = aux_weight * aux_term + balance_weight * balance
+    if balance_weight > 0:
+        loss = loss + balance_weight * balance
     return loss, {"aux_ce": aux_term.item(), "balance": balance.item(),
                   "usage": usage.detach().cpu().numpy()}
 
 
+# -------------------------------------------------------------- diagnostics
 # -------------------------------------------------------------- diagnostics
 def yule_q(ci, cj):
     """Windeatt eq. (6): Q = (N11 N00 - N01 N10) / (N11 N00 + N01 N10), where
     N^ab counts nuclei with expert i correct=a and expert j correct=b.
     +1 = experts err on the same nuclei (no gain from combining); 0 =
     independent errors; negative = complementary errors."""
-    n11 = np.sum(ci & cj); n00 = np.sum(~ci & ~cj)
-    n10 = np.sum(ci & ~cj); n01 = np.sum(~ci & cj)
+    n11 = int(np.sum(ci & cj))
+    n00 = int(np.sum(~ci & ~cj))
+    n10 = int(np.sum(ci & ~cj))
+    n01 = int(np.sum(~ci & cj))
     den = n11 * n00 + n01 * n10
     return float((n11 * n00 - n01 * n10) / den) if den else float("nan")
 
@@ -225,12 +312,12 @@ def report_experts(model, X_t, st_t, y, subtypes_arr, classes, title="VALIDATION
     model.eval()
     logits, aux = model(X_t, st_t, return_aux=True)
     pred = logits.argmax(1).cpu().numpy()
-    ep = aux["expert_logits"].argmax(2).cpu().numpy()      # N,E
+    ep = aux["expert_logits_diag"].argmax(2).cpu().numpy()  # N,E
     g = aux["gate"].cpu().numpy()
     names = model.group_names
     correct = ep == y[:, None]
 
-    print(f"\n=== MoE EXPERT DIAGNOSTICS ({title}) ===")
+    print(f"\n=== MoE EXPERT DIAGNOSTICS ({title}, gate={model.gate_type}) ===")
     print(f"fused model acc={np.mean(pred == y):.4f}")
     print("per-expert aux-head accuracy (each expert alone):")
     for i, n in enumerate(names):
@@ -275,7 +362,8 @@ def build_from_config(cfg, n_features, n_classes):
                          head_hidden=cfg["head_hidden"], dropout=cfg["dropout"],
                          subtype_dim=cfg["subtype_dim"], use_subtype=cfg["use_subtype"],
                          gate_temp=cfg["gate_temp"], expert_dropout=cfg["expert_dropout"],
-                         subtype_drop=cfg["subtype_drop"])
+                         subtype_drop=cfg["subtype_drop"],
+                         gate_type=cfg.get("gate_type", "learned"), bag=cfg.get("bag", False))
 
 
 def subtype_indices(subtypes_arr, vocab):
