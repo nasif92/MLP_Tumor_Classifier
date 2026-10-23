@@ -83,6 +83,64 @@ python train_deploy.py --out moe_<subtype>_no_context_derived_s43.pt --cache_dir
 python train_deploy.py --out moe_<subtype>_no_context_derived_s44.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set no_context_derived --seed 44 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_no_context_derived_s44.txt
 ```
 
+## Extra experiments (not yet in the MoE doc, or only run pooled there)
+
+The MoE doc already covers: all 108, no context, context only (MLP), no DAB, no DAB+OD (MLP and MoE), the gate variants, and removing one expert at a time. These commands add what it is missing, per stain (`<subtype>`).
+
+### 1. Context only (MoE; the doc has the MLP only). Also repeats MLP context-only with this protocol
+
+```bash
+# context_only_derived - mlp
+python train_deploy.py --out mlp_<subtype>_context_only_derived_s42.pt --cache_dir ./cache --subtypes <subtype> --arch mlp --feature_set context_only_derived --seed 42 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_mlp_context_only_derived_s42.txt
+python train_deploy.py --out mlp_<subtype>_context_only_derived_s43.pt --cache_dir ./cache --subtypes <subtype> --arch mlp --feature_set context_only_derived --seed 43 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_mlp_context_only_derived_s43.txt
+python train_deploy.py --out mlp_<subtype>_context_only_derived_s44.pt --cache_dir ./cache --subtypes <subtype> --arch mlp --feature_set context_only_derived --seed 44 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_mlp_context_only_derived_s44.txt
+# context_only_derived - moe
+python train_deploy.py --out moe_<subtype>_context_only_derived_s42.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set context_only_derived --seed 42 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_context_only_derived_s42.txt
+python train_deploy.py --out moe_<subtype>_context_only_derived_s43.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set context_only_derived --seed 43 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_context_only_derived_s43.txt
+python train_deploy.py --out moe_<subtype>_context_only_derived_s44.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set context_only_derived --seed 44 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_context_only_derived_s44.txt
+```
+
+### 2. MoE gate variants (doc ran them pooled; this runs them for one stain)
+
+```bash
+# gate learned
+python train_deploy.py --out moe_<subtype>_all_derived_learned_s42.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_gate learned --seed 42 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_learned_s42.txt
+python train_deploy.py --out moe_<subtype>_all_derived_learned_s43.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_gate learned --seed 43 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_learned_s43.txt
+python train_deploy.py --out moe_<subtype>_all_derived_learned_s44.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_gate learned --seed 44 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_learned_s44.txt
+# gate global
+python train_deploy.py --out moe_<subtype>_all_derived_global_s42.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_gate global --seed 42 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_global_s42.txt
+python train_deploy.py --out moe_<subtype>_all_derived_global_s43.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_gate global --seed 43 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_global_s43.txt
+python train_deploy.py --out moe_<subtype>_all_derived_global_s44.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_gate global --seed 44 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_global_s44.txt
+# gate per_stain
+python train_deploy.py --out moe_<subtype>_all_derived_per_stain_s42.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_gate per_stain --seed 42 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_per_stain_s42.txt
+python train_deploy.py --out moe_<subtype>_all_derived_per_stain_s43.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_gate per_stain --seed 43 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_per_stain_s43.txt
+python train_deploy.py --out moe_<subtype>_all_derived_per_stain_s44.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_gate per_stain --seed 44 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_per_stain_s44.txt
+# gate vote
+python train_deploy.py --out moe_<subtype>_all_derived_vote_s42.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_gate vote --seed 42 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_vote_s42.txt
+python train_deploy.py --out moe_<subtype>_all_derived_vote_s43.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_gate vote --seed 43 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_vote_s43.txt
+python train_deploy.py --out moe_<subtype>_all_derived_vote_s44.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_gate vote --seed 44 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_vote_s44.txt
+# gate prob_mix
+python train_deploy.py --out moe_<subtype>_all_derived_prob_mix_s42.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_gate prob_mix --seed 42 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_prob_mix_s42.txt
+python train_deploy.py --out moe_<subtype>_all_derived_prob_mix_s43.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_gate prob_mix --seed 43 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_prob_mix_s43.txt
+python train_deploy.py --out moe_<subtype>_all_derived_prob_mix_s44.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_gate prob_mix --seed 44 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_prob_mix_s44.txt
+```
+(`uniform` is the default MoE command above.)
+
+### 3. Remove hematoxylin and nuclear morphology experts together (the doc lists this as untested)
+
+Group names are printed at the top of an MoE log; replace `<hema group>` and `<morphology group>` with the exact names shown there.
+
+```bash
+python train_deploy.py --out moe_<subtype>_all_derived_drop_hema_morph_s42.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_drop_groups <hema group> <morphology group> --seed 42 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_drop_hema_morph_s42.txt
+python train_deploy.py --out moe_<subtype>_all_derived_drop_hema_morph_s43.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_drop_groups <hema group> <morphology group> --seed 43 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_drop_hema_morph_s43.txt
+python train_deploy.py --out moe_<subtype>_all_derived_drop_hema_morph_s44.pt --cache_dir ./cache --subtypes <subtype> --arch moe --feature_set all_derived --moe_drop_groups <hema group> <morphology group> --seed 44 --epochs 200 --lr_schedule cosine 2>&1 | tee log_<subtype>_moe_all_derived_drop_hema_morph_s44.txt
+```
+
+### 4. Not runnable yet (needs a code change)
+
+- Per-slide DAB/OD normalisation (standardise each slide's DAB and OD columns by that slide's own mean and SD instead of the global training mean). `train_deploy.py` has no flag for this; ask me to add `--slide_norm dab` when you want it. Test it on Ki67 first, using the all_derived and no_dab results above as the reference.
+- Pooled vs per-stain Ki67: pooled needs `--subtypes ER PR Ki67` and `ER-PR-Ki67` in the file names; then compare the Ki67 slide-mean line against the per-stain Ki67 runs.
+
 ## Summary line per log
 
 Prints, for every log, the external-test accuracy and the slide-mean accuracy per stain (the last matches in a log are the external test; the validation block comes first).
