@@ -14,11 +14,6 @@ Usage:
 
     # Single-slide training (e.g. one small dataset):
     python3 train_deploy.py --feat_dir <dir_with_one_slide> --ann_dir <ann_dir> --out one_slide.pt
-
-    # Feature-group Mixture-of-Experts (see moe.py), stain-conditioned gate:
-    python train_deploy.py --arch moe --feature_set default_derived --out moe.pt --cache_dir ./cache
-    # Matched baseline for the same features:
-    python train_deploy.py --arch mlp --feature_set default_derived --out mlp.pt --cache_dir ./cache
 """
 import argparse
 import gzip
@@ -33,7 +28,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import moe
 
 # Curated reference/validation slides: one detections dir + one annotations
 # dir PER SUBTYPE, paths from config.py. A plain run validates the pooled
@@ -285,23 +279,20 @@ class MLP(nn.Module):
             prev = h
         layers.append(nn.Linear(prev, n_classes))
         self.net = nn.Sequential(*layers)
-        self.feat_dim = hidden[-1]
 
-    def forward(self, x, subtype=None):  # subtype accepted (and ignored) so MLP/MoE share call sites
+    def forward(self, x):
         return self.net(x)
 
-    def features(self, x, subtype=None):
+    def features(self, x):
         """Shared-trunk representation (everything before the final Linear).
         Used by --domain_adversarial to attach a domain head; unused, and
         adding nothing to model_state, when that flag is off."""
         return self.net[:-1](x)
 
-    def classify(self, feats):
+    def head(self, feats):
         """Final Linear applied to a features() output - forward(x) ==
-        classify(features(x)). (Named to match MoEClassifier.classify.)"""
+        head(features(x))."""
         return self.net[-1](feats)
-
-    head = classify  # backwards-compatible alias
 
 
 class _GradReverseFn(torch.autograd.Function):
@@ -407,7 +398,6 @@ def load_and_label(df_ext, classes, feat_cols=None, medians=None, mu=None, sd=No
     df_ext = df_ext[df_ext["_label"].isin(classes)].reset_index(drop=True)
     if df_ext.empty or feat_cols is None:
         return df_ext, None, None
-    moe.add_derived_features(df_ext)
     missing = [c for c in feat_cols if c not in df_ext.columns]
     if missing:
         print(f"  WARNING: {len(missing)} training feature(s) absent from this data - "
@@ -454,66 +444,6 @@ def report_eval_by_subtype(name, y_true, y_pred, classes, subtypes_arr, slides_a
     print(per.sort_values(["subtype", "acc"]).round(3).to_string())
     print("slide-mean acc by subtype: " + ", ".join(
         f"{st}={g['acc'].mean():.4f}" for st, g in per.groupby("subtype")))
-
-
-def report_ghost_aware(name, y_true, logits, classes, subtypes_arr, slides_arr):
-    """Extra scoring when 'Ghost' is one of the trained classes (otherwise a no-op).
-
-    A nucleus PREDICTED Ghost is rejected: at deployment it is left unclassified. All
-    accuracies below are over nuclei whose TRUE label is a real class (Tumor / Non Tumor):
-      forced    pick Tumor vs Non Tumor ignoring the Ghost output - directly comparable
-                to a model trained without Ghost (shows what adding the class costs)
-      strict    a Ghost prediction counts as an error (what rejecting costs you)
-      coverage  fraction of real nuclei NOT rejected
-      kept      accuracy among the real nuclei that were not rejected
-    Ghost precision / recall are over ALL nuclei, true ghosts included.
-    Slide-mean = mean over slides, like the 'slide-mean acc by subtype' line."""
-    if "Ghost" not in classes:
-        return
-    g = classes.index("Ghost")
-    real = [i for i in range(len(classes)) if i != g]
-    logits = np.asarray(logits)
-    pred = logits.argmax(1)
-    forced = np.asarray(real)[logits[:, real].argmax(1)]
-    subtypes_arr, slides_arr = np.asarray(subtypes_arr), np.asarray(slides_arr)
-
-    def prec_rec(yt, pr):
-        tp = int(((pr == g) & (yt == g)).sum())
-        npred, ntrue = int((pr == g).sum()), int((yt == g).sum())
-        return (tp / npred if npred else np.nan), (tp / ntrue if ntrue else np.nan), ntrue
-
-    rows = []
-    for slide in pd.unique(slides_arr):
-        m = slides_arr == slide
-        yt, pr, fo = y_true[m], pred[m], forced[m]
-        r = yt != g
-        nr = int(r.sum())
-        kept = r & (pr != g)
-        p, rc, _ = prec_rec(yt, pr)
-        rows.append({
-            "slide": slide, "subtype": subtypes_arr[m][0], "n_real": nr, "n_ghost": int((~r).sum()),
-            "forced": float((fo[r] == yt[r]).mean()) if nr else np.nan,
-            "strict": float((pr[r] == yt[r]).mean()) if nr else np.nan,
-            "coverage": float(kept.sum() / nr) if nr else np.nan,
-            "kept": float((pr[kept] == yt[kept]).mean()) if kept.any() else np.nan,
-            "ghost_P": p, "ghost_R": rc})
-    per = pd.DataFrame(rows).set_index("slide")
-    print(f"\n{name} - ghost-aware (Ghost prediction = rejected), per slide:")
-    print(per.sort_values(["subtype", "forced"]).round(3).to_string())
-
-    def by_st(col):
-        return ", ".join(f"{st}={v:.4f}" for st, v in per.groupby("subtype")[col].mean().items())
-    print("forced slide-mean acc by subtype: " + by_st("forced"))
-    print("strict slide-mean acc by subtype: " + by_st("strict"))
-    print("coverage slide-mean by subtype: " + by_st("coverage"))
-    print("kept slide-mean acc by subtype: " + by_st("kept"))
-    gp, gr = [], []
-    for st in sorted(set(subtypes_arr)):
-        m = subtypes_arr == st
-        p, rc, nt = prec_rec(y_true[m], pred[m])
-        gp.append(f"{st}={p:.4f}"); gr.append(f"{st}={rc:.4f}")
-    print("ghost precision by subtype: " + ", ".join(gp))
-    print("ghost recall by subtype: " + ", ".join(gr))
 
 
 def slide_overlap_check(train_slides, test_slides, what="validation"):
@@ -615,45 +545,6 @@ def main():
                          "of the per-subtype losses, so a subtype with many validation "
                          "nuclei can't drown out the others; 'pooled' = loss over all "
                          "validation nuclei together.")
-    # ---------------------------------------------------------- architecture
-    ap.add_argument("--arch", choices=["mlp", "moe"], default="mlp",
-                    help="'mlp' = the original single MLP (--hidden/--dropout). 'moe' = "
-                         "feature-group mixture of experts from moe.py: one small expert per "
-                         "feature family (shape/size/intensity/texture[/context/embedding]), "
-                         "a stain-conditioned softmax gate, and a shared head.")
-    ap.add_argument("--moe_dim", type=int, default=32, help="Per-expert embedding size d.")
-    ap.add_argument("--moe_expert_hidden", type=int, default=32,
-                    help="Expert hidden width (auto-widened to 2x inputs for big groups, e.g. texture).")
-    ap.add_argument("--moe_gate_hidden", type=int, default=64)
-    ap.add_argument("--moe_head_hidden", type=int, default=32)
-    ap.add_argument("--moe_dropout", type=float, default=0.2,
-                    help="Dropout inside experts/gate/head (MoE only; --dropout is the MLP's).")
-    ap.add_argument("--moe_expert_dropout", type=float, default=0.15,
-                    help="Per-nucleus probability of masking a whole expert during training.")
-    ap.add_argument("--moe_aux_weight", type=float, default=0.2,
-                    help="Weight of the per-expert auxiliary CE losses (0 = off).")
-    ap.add_argument("--moe_balance_weight", type=float, default=0.01,
-                    help="Weight of the gate load-balancing term KL(usage||uniform) (0 = off).")
-    ap.add_argument("--moe_bag", action="store_true",
-                    help="Online bagging: each (nucleus, expert) pair gets a Poisson(1) "
-                         "weight on EVERY gradient reaching that expert, so each expert "
-                         "trains on its own bootstrap-like sample (Windeatt 2008, S.2).")
-    ap.add_argument("--moe_gate", choices=list(moe.GATE_TYPES), default="learned",
-                    help="How expert outputs are combined. learned = per-nucleus gate on "
-                         "features[+stain] (default, the original MoE); uniform = equal "
-                         "weights; global = one learned weight per expert; per_stain = one "
-                         "learned weight per expert per stain; vote = no head, equal-weight "
-                         "average of the experts' own class probabilities (Windeatt Fig. 1); "
-                         "prob_mix = no head, learned per-nucleus gate over those probabilities.")
-    ap.add_argument("--moe_gate_temp", type=float, default=1.0,
-                    help="Gate softmax temperature (>1 = softer mixing, <1 = sharper routing).")
-    ap.add_argument("--moe_no_subtype_gate", action="store_true",
-                    help="Don't feed the stain (ER/PR/Ki67) to the gate.")
-    ap.add_argument("--moe_subtype_drop", type=float, default=0.2,
-                    help="Probability of hiding the stain from the gate during training, so "
-                         "inference without a stain still works.")
-    ap.add_argument("--moe_drop_groups", nargs="*", default=[],
-                    help="Expert groups to leave out entirely (ablations), e.g. --moe_drop_groups texture.")
     ap.add_argument("--hidden", nargs="+", type=int, default=[96,48, 24, 12, 6])
     ap.add_argument("--dropout", type=float, default=0.5)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -769,7 +660,6 @@ def main():
             print(f"  '{k}': {v}")
     df = df.dropna(subset=["_label"])
     df = df[df["_label"].isin(args.classes)].reset_index(drop=True)
-    moe.add_derived_features(df)  # e.g. "Derived: Aspect ratio" - only used if the feature set lists it
 
     discovered_cols = [c for c in df.columns
                        if c not in NON_FEATURE_COLS and not c.startswith("_")
@@ -789,19 +679,6 @@ def main():
     if missing:
         print(f"  NOT found (dropped, not median-filled): {missing[:10]}"
               + (" ..." if len(missing) > 10 else ""))
-
-    moe_groups = None
-    if args.arch == "moe":
-        if args.moe_drop_groups:
-            # Remove ablated groups' columns from the input entirely (gate included),
-            # so the ablation is a true "without these features" model.
-            keep = set(i for idx in moe.assign_groups(feat_cols, args.moe_drop_groups).values()
-                       for i in idx)
-            dropped_cols = [c for i, c in enumerate(feat_cols) if i not in keep]
-            feat_cols = [c for i, c in enumerate(feat_cols) if i in keep]
-            print(f"  --moe_drop_groups {args.moe_drop_groups}: removed {len(dropped_cols)} feature(s)")
-        moe_groups = moe.assign_groups(feat_cols)
-        moe.print_groups(moe_groups, feat_cols)
 
     print(f"\n{len(df)} nuclei | {df['slide_uid'].nunique()} slides | {len(feat_cols)} features")
     print("\nClass counts:\n", df["_label"].value_counts())
@@ -871,39 +748,7 @@ def main():
     steps_per_epoch = max(1, len(y_tr) // args.batch_size)
 
 
-    # Stain vocabulary for the MoE gate (index len(vocab) = "unknown").
-    subtype_vocab = sorted(set(args.subtypes))
-    st_tr_t = torch.as_tensor(moe.subtype_indices(subtype_tr, subtype_vocab), device=device)
-
-    moe_config = None
-    if args.arch == "moe":
-        moe_config = {
-            "groups": [(k, list(v)) for k, v in moe_groups.items()],
-            "n_subtypes": len(subtype_vocab), "d": args.moe_dim,
-            "expert_hidden": args.moe_expert_hidden, "gate_hidden": args.moe_gate_hidden,
-            "head_hidden": args.moe_head_hidden, "dropout": args.moe_dropout,
-            "subtype_dim": 8, "use_subtype": not args.moe_no_subtype_gate,
-            "gate_temp": args.moe_gate_temp, "expert_dropout": args.moe_expert_dropout,
-            "subtype_drop": args.moe_subtype_drop,
-            "gate_type": args.moe_gate, "bag": args.moe_bag,
-        }
-
-    def make_model():
-        if args.arch == "moe":
-            return moe.build_from_config(moe_config, len(feat_cols), len(classes)).to(device)
-        return MLP(len(feat_cols), len(classes), tuple(args.hidden), args.dropout).to(device)
-
-    model = make_model()
-    n_params = sum(p.numel() for p in model.parameters())
-    msg = f"\nModel: {args.arch.upper()}  ({n_params:,} parameters)"
-    if args.arch == "moe":
-        msg += (f"  gate={model.gate_type}"
-                + (f", stain-conditioned over {subtype_vocab}" if model.use_subtype else "")
-                + f" | aux_weight={args.moe_aux_weight} balance={args.moe_balance_weight} "
-                  f"expert_dropout={args.moe_expert_dropout} stain_dropout="
-                  f"{args.moe_subtype_drop if model.use_subtype else 'n/a'} bag={args.moe_bag} "
-                  f"domain_adv={args.domain_adversarial}")
-    print(msg)
+    model = MLP(len(feat_cols), len(classes), tuple(args.hidden), args.dropout).to(device)
     crit = nn.CrossEntropyLoss()
 
     # ---------------------------------------------------- domain-adversarial
@@ -921,7 +766,7 @@ def main():
         n_domains = len(domain_levels)
         domain_codes_tr_t = torch.as_tensor(domain_codes_tr, dtype=torch.long, device=device)
         domain_head = nn.Sequential(
-            nn.Linear(model.feat_dim, args.domain_hidden), nn.ReLU(),
+            nn.Linear(args.hidden[-1], args.domain_hidden), nn.ReLU(),
             nn.Linear(args.domain_hidden, n_domains)).to(device)
         # Domain classes are usually imbalanced (one site can dominate training
         # nuclei). Unweighted CE lets the head settle for "always predict the
@@ -978,8 +823,6 @@ def main():
 
     X_te_t = torch.from_numpy(X_te_s).to(device) if has_val else None
     y_te_t = torch.from_numpy(y_te).to(device) if has_val else None
-    st_te_t = (torch.as_tensor(moe.subtype_indices(sub_te, subtype_vocab), device=device)
-               if has_val else None)
     # Index tensors per validation subtype (for per-subtype loss/acc every eval).
     val_groups = ({st: torch.as_tensor(np.flatnonzero(sub_te == st), device=device)
                    for st in sorted(set(sub_te))} if has_val else {})
@@ -1010,9 +853,6 @@ def main():
             "mu": mu, "sd": sd,
             "medians": medians[feat_cols].to_numpy(),
             "hidden": args.hidden, "dropout": args.dropout,
-            "arch": args.arch,
-            "moe_config": moe_config,
-            "subtype_vocab": subtype_vocab,
             "subtypes": args.subtypes,
             "subtype_balance": args.subtype_balance,
             "domain_adversarial": args.domain_adversarial,
@@ -1054,7 +894,6 @@ def main():
     domain_acc_ema = None
     for ep in range(1, args.epochs + 1):
         last_epoch = ep
-        moe_parts_acc = []
         model.train()
         if domain_head is not None:
             domain_head.train()
@@ -1062,27 +901,19 @@ def main():
                                            args.domain_lambda_max)
         for _ in range(steps_per_epoch):
             idx = torch.multinomial(w_t, args.batch_size, replacement=True)
-            xb, yb, stb = X_tr_t[idx], y_tr_t[idx], st_tr_t[idx]
+            xb, yb = X_tr_t[idx], y_tr_t[idx]
             opt.zero_grad()
-            feats = None
-            if args.arch == "moe":
-                outputs, aux = model(xb, stb, return_aux=True)
-                feats = aux["fused"]
-                extra, parts = moe.auxiliary_loss(aux, yb, args.moe_aux_weight,
-                                                  args.moe_balance_weight, model)
-                loss = crit(outputs, yb) + extra
-                moe_parts_acc.append(parts)
-            elif domain_head is not None:
+            if domain_head is not None:
                 feats = model.features(xb)
-                outputs = model.classify(feats)
-                loss = crit(outputs, yb)
+                outputs = model.head(feats)
+                task_loss = crit(outputs, yb)
+                dom_logits = domain_head(grad_reverse(feats, lambd))
+                dom_target = domain_codes_tr_t[idx]
+                dom_loss = domain_crit(dom_logits, dom_target)
+                loss = task_loss + dom_loss
             else:
                 outputs = model(xb)
                 loss = crit(outputs, yb)
-            if domain_head is not None:
-                dom_logits = domain_head(grad_reverse(feats, lambd))
-                dom_target = domain_codes_tr_t[idx]
-                loss = loss + domain_crit(dom_logits, dom_target)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             if domain_head is not None:
@@ -1095,7 +926,7 @@ def main():
         if recompute:
             model.eval()
             with torch.no_grad():
-                tr_logits = model(X_tr_t, st_tr_t)
+                tr_logits = model(X_tr_t)
                 tr_pred_full = tr_logits.argmax(1).cpu().numpy()
                 train_loss = crit(tr_logits, y_tr_t).item()
             train_pc_acc, _ = per_class_accuracy(y_tr, tr_pred_full, classes)
@@ -1106,7 +937,7 @@ def main():
             if domain_head is not None:
                 domain_head.eval()
                 with torch.no_grad():
-                    dom_pred = domain_head(model.features(X_tr_t, st_tr_t)).argmax(1).cpu().numpy()
+                    dom_pred = domain_head(model.features(X_tr_t)).argmax(1).cpu().numpy()
                 dom_pc_acc, _ = per_class_accuracy(domain_codes_tr, dom_pred,
                                                    list(range(n_domains)))
                 domain_acc_ema = float(np.mean(list(dom_pc_acc.values())))  # macro/balanced
@@ -1121,7 +952,7 @@ def main():
         if do_eval:
             model.eval()
             with torch.no_grad():
-                val_logits = model(X_te_t, st_te_t)
+                val_logits = model(X_te_t)
                 pooled_loss = crit(val_logits, y_te_t).item()
                 val_pred_t = val_logits.argmax(1)
                 last_val_by_subtype = {
@@ -1152,15 +983,6 @@ def main():
         if scheduler is not None and args.lr_schedule == "cosine":
             scheduler.step()
 
-        moe_usage = None
-        if moe_parts_acc:
-            moe_usage = np.mean([p["usage"] for p in moe_parts_acc], axis=0)
-            if writer is not None:
-                writer.add_scalar("moe/aux_ce", np.mean([p["aux_ce"] for p in moe_parts_acc]), ep)
-                writer.add_scalar("moe/balance", np.mean([p["balance"] for p in moe_parts_acc]), ep)
-                for gname, u in zip(model.group_names, moe_usage):
-                    writer.add_scalar(f"moe_gate/{gname}", float(u), ep)
-
         # Checkpoint on improvement: val loss when a val set exists, else train acc.
         improved = val_loss_improved if has_val else train_improved
         if improved:
@@ -1170,9 +992,6 @@ def main():
 
         if ep % 10 == 0 or ep == 1 or ep == args.epochs:
             msg = f"  epoch {ep:03d}  {train_metrics.to_str()}"
-            if moe_usage is not None:
-                msg += "\n              gate usage: " + "  ".join(
-                    f"{n}={u:.2f}" for n, u in zip(model.group_names, moe_usage))
             if domain_head is not None and domain_acc_ema is not None:
                 chance = 1.0 / n_domains  # the right comparison for a BALANCED metric
                 msg += (f"\n              domain_balanced_acc={domain_acc_ema:.4f} "
@@ -1213,15 +1032,12 @@ def main():
     if has_val:
         model.eval()
         with torch.no_grad():
-            logits_val = model(X_te_t, st_te_t).cpu().numpy()
-        pred = logits_val.argmax(1)
+            pred = model(X_te_t).argmax(1).cpu().numpy()
         tag = "best epoch" if args.early_stop else "final epoch"
         if args.early_stop:
             # `model` already IS the reloaded best checkpoint - full report.
             report_eval_by_subtype(f"VALIDATION ({val_label.upper()}, {tag})",
                                    y_te, pred, classes, sub_te, slide_te)
-            report_ghost_aware(f"VALIDATION ({val_label.upper()}, {tag})",
-                               y_te, logits_val, classes, sub_te, slide_te)
         else:
             # Brief one-liner here; the full report below is for the
             # checkpoint that's actually deployed (.best), which is what
@@ -1238,24 +1054,15 @@ def main():
         # Full report for the checkpoint that's actually deployed (.best).
         if not args.early_stop and os.path.exists(ckpt_best_path):
             best_ckpt = torch.load(ckpt_best_path, map_location=device, weights_only=False)
-            best_model = make_model()
+            best_model = MLP(len(feat_cols), len(classes), tuple(args.hidden),
+                             args.dropout).to(device)
             best_model.load_state_dict(best_ckpt["model_state"])
             best_model.eval()
             with torch.no_grad():
-                best_logits = best_model(X_te_t, st_te_t).cpu().numpy()
-            best_pred = best_logits.argmax(1)
+                best_pred = best_model(X_te_t).argmax(1).cpu().numpy()
             report_eval_by_subtype(
                 f"VALIDATION ({val_label.upper()}, best checkpoint epoch {best_ckpt['epoch']})",
                 y_te, best_pred, classes, sub_te, slide_te)
-            report_ghost_aware(
-                f"VALIDATION ({val_label.upper()}, best checkpoint epoch {best_ckpt['epoch']})",
-                y_te, best_logits, classes, sub_te, slide_te)
-            if args.arch == "moe":
-                moe.report_experts(best_model, X_te_t, st_te_t, y_te, sub_te, classes,
-                                   f"{val_label}, best checkpoint")
-        if args.arch == "moe" and args.early_stop:
-            moe.report_experts(model, X_te_t, st_te_t, y_te, sub_te, classes,
-                               f"{val_label}, best epoch")
 
     if args.val_source != "test" and args.pool_reference_into_train:
         print("\n(EXTERNAL TEST SET skipped: --pool_reference_into_train means these "
@@ -1278,22 +1085,11 @@ def main():
                 slide_overlap_check(df.loc[tr, "wsi_name"], df_ext["wsi_name"], "external test")
                 model.eval()
                 with torch.no_grad():
-                    st_ext_t = torch.as_tensor(moe.subtype_indices(
-                        df_ext["subtype"].to_numpy(), subtype_vocab), device=device)
-                    ext_logits = model(torch.from_numpy(X_ext_s).to(device),
-                                       st_ext_t).cpu().numpy()
-                ext_pred = ext_logits.argmax(1)
+                    ext_pred = model(torch.from_numpy(X_ext_s).to(device)).argmax(1).cpu().numpy()
                 print(f"  {len(df_ext)} nuclei | {df_ext['slide_uid'].nunique()} slides")
                 report_eval_by_subtype("EXTERNAL TEST", y_ext, ext_pred, classes,
                                        df_ext["subtype"].to_numpy(),
                                        df_ext["slide_uid"].to_numpy())
-                report_ghost_aware("EXTERNAL TEST", y_ext, ext_logits, classes,
-                                   df_ext["subtype"].to_numpy(),
-                                   df_ext["slide_uid"].to_numpy())
-                if args.arch == "moe":
-                    moe.report_experts(model, torch.from_numpy(X_ext_s).to(device), st_ext_t,
-                                       y_ext, df_ext["subtype"].to_numpy(), classes,
-                                       "EXTERNAL TEST")
 
     torch.save(ckpt_dict(last_epoch, train_metrics, val_metrics), args.out)
     if args.early_stop and has_val:
